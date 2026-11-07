@@ -3,6 +3,7 @@ package stdlib
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 
 	"github.com/zclconf/go-cty/cty"
@@ -3127,5 +3128,514 @@ func TestDistinct(t *testing.T) {
 				t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, test.Want)
 			}
 		})
+	}
+}
+
+// unknownGroupByResult builds the expected wholly-unknown result of
+// GroupBy on values of the given element type with a refined range for the
+// number of resulting groups. The function framework additionally marks all
+// GroupBy results as non-null.
+func unknownGroupByResult(ety cty.Type, lower, upper int) cty.Value {
+	return cty.UnknownVal(cty.Map(cty.List(ety))).Refine().
+		CollectionLengthLowerBound(lower).
+		CollectionLengthUpperBound(upper).
+		NewValue().
+		RefineNotNull()
+}
+
+func TestGroupByReturnType(t *testing.T) {
+	got, err := GroupByFunc.ReturnType([]cty.Type{
+		cty.List(cty.Number),
+		cty.List(cty.String),
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	want := cty.Map(cty.List(cty.Number))
+	if !got.Equals(want) {
+		t.Fatalf("wrong return type\ngot:  %#v\nwant: %#v", got, want)
+	}
+}
+
+func TestGroupBy(t *testing.T) {
+	objVal := func(n int64) cty.Value {
+		return cty.ObjectVal(map[string]cty.Value{"n": cty.NumberIntVal(n)})
+	}
+	// "é" as NFD (e + combining acute) and NFC respectively; cty normalizes
+	// both into the same string.
+	nfdKey := cty.StringVal("e\u0301")
+	nfcKey := cty.StringVal("\u00e9")
+
+	tests := []struct {
+		Name   string
+		Values cty.Value
+		Keys   cty.Value
+		Want   cty.Value
+		Err    string
+	}{
+		{
+			Name:   "empty inputs produce a known empty map of the right type",
+			Values: cty.ListValEmpty(cty.Number),
+			Keys:   cty.ListValEmpty(cty.String),
+			Want:   cty.MapValEmpty(cty.List(cty.Number)),
+		},
+		{
+			// An unknown values list refined to length zero collapses to a
+			// known empty list, so the result is a known empty map.
+			Name:   "length-zero refined unknown lists produce a known empty map",
+			Values: cty.UnknownVal(cty.List(cty.Number)).Refine().CollectionLength(0).NewValue(),
+			Keys:   cty.ListValEmpty(cty.String),
+			Want:   cty.MapValEmpty(cty.List(cty.Number)),
+		},
+		{
+			Name: "groups preserve input order and duplicate values",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2), cty.NumberIntVal(3),
+				cty.NumberIntVal(4), cty.NumberIntVal(5),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"), cty.StringVal("a"),
+				cty.StringVal("b"), cty.StringVal("a"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.NumberIntVal(1), cty.NumberIntVal(3), cty.NumberIntVal(5),
+				}),
+				"b": cty.ListVal([]cty.Value{
+					cty.NumberIntVal(2), cty.NumberIntVal(4),
+				}),
+			}),
+		},
+		{
+			// The two key spellings normalize to the same cty string, so
+			// they form a single group.
+			Name: "keys are grouped after Unicode normalization",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{nfdKey, nfcKey}),
+			Want: cty.MapVal(map[string]cty.Value{
+				nfcKey.AsString(): cty.ListVal([]cty.Value{
+					cty.NumberIntVal(1), cty.NumberIntVal(2),
+				}),
+			}),
+		},
+		{
+			Name: "empty string is a valid key",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2), cty.NumberIntVal(3),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal(""), cty.StringVal("x"), cty.StringVal(""),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"":  cty.ListVal([]cty.Value{cty.NumberIntVal(1), cty.NumberIntVal(3)}),
+				"x": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+			}),
+		},
+		{
+			// Objects must be moved verbatim, not rendered as JSON strings.
+			Name: "object values stay objects and are not deduplicated",
+			Values: cty.ListVal([]cty.Value{objVal(1), objVal(2)}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("a"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{objVal(1), objVal(2)}),
+			}),
+		},
+		{
+			Name: "null payload elements are grouped like any other element",
+			Values: cty.ListVal([]cty.Value{
+				cty.NullVal(cty.Number), cty.NumberIntVal(1),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("a"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.NullVal(cty.Number), cty.NumberIntVal(1),
+				}),
+			}),
+		},
+		{
+			// Known keys with partially-unknown values still yield a known
+			// group structure.
+			Name: "partially unknown values keep the known group structure",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.UnknownVal(cty.Number), cty.NumberIntVal(3),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"), cty.StringVal("a"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.NumberIntVal(1), cty.NumberIntVal(3),
+				}),
+				"b": cty.ListVal([]cty.Value{
+					cty.UnknownVal(cty.Number),
+				}),
+			}),
+		},
+		{
+			// A wholly-unknown values list of known length presents as a
+			// known list of typed unknown elements, so the groups must have
+			// accurate lengths rather than collapsing to a single unknown.
+			Name:   "wholly unknown values of known length build sized groups",
+			Values: cty.UnknownVal(cty.List(cty.Number)).Refine().CollectionLength(3).NewValue(),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"), cty.StringVal("a"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{
+					cty.UnknownVal(cty.Number), cty.UnknownVal(cty.Number),
+				}),
+				"b": cty.ListVal([]cty.Value{
+					cty.UnknownVal(cty.Number),
+				}),
+			}),
+		},
+		{
+			// Deep marks on value elements travel with the element.
+			Name: "marks on unknown value elements move with the element",
+			Values: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.Number).Mark("p"), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{cty.UnknownVal(cty.Number).Mark("p")}),
+				"b": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+			}),
+		},
+		{
+			Name:   "all keys unknown with no known keys bounds groups to 1..2",
+			Values: cty.ListVal([]cty.Value{cty.NumberIntVal(1), cty.NumberIntVal(2)}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String), cty.UnknownVal(cty.String),
+			}),
+			Want: unknownGroupByResult(cty.Number, 1, 2),
+		},
+		{
+			Name: "one known and two unknown keys bounds groups to 1..3",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2), cty.NumberIntVal(3),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.UnknownVal(cty.String), cty.UnknownVal(cty.String),
+			}),
+			Want: unknownGroupByResult(cty.Number, 1, 3),
+		},
+		{
+			Name: "two known and one unknown key bounds groups to 2..3",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2), cty.NumberIntVal(3),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"), cty.UnknownVal(cty.String),
+			}),
+			Want: unknownGroupByResult(cty.Number, 2, 3),
+		},
+		{
+			Name:   "a single unknown key means exactly one group",
+			Values: cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String),
+			}),
+			Want: unknownGroupByResult(cty.Number, 1, 1),
+		},
+		{
+			// A known string prefix on an unknown key must not be turned into
+			// a guessed group name.
+			Name: "unknown key prefix is not used to guess a group name",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("x"),
+				cty.UnknownVal(cty.String).Refine().StringPrefix("foo").NewValue(),
+			}),
+			Want: unknownGroupByResult(cty.Number, 1, 2),
+		},
+		{
+			// Marks on key elements and on value elements all aggregate onto
+			// the unknown result container.
+			Name: "unknown keys hoist key and payload marks onto the result",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1).Mark("p"), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String).Mark("k"), cty.StringVal("a"),
+			}),
+			Want: unknownGroupByResult(cty.Number, 1, 2).Mark("k").Mark("p"),
+		},
+		{
+			// Values of unknown length against known keys of a different
+			// length could still be equal, so the result is unknown without
+			// claiming any structure.
+			Name:   "unknown values length conservatively yields an unknown map",
+			Values: cty.UnknownVal(cty.List(cty.Number)),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Want: cty.UnknownVal(cty.Map(cty.List(cty.Number))).RefineNotNull(),
+		},
+		{
+			// Conversely, payload marks that cannot be placed on concrete
+			// groups are hoisted onto the unknown result.
+			Name: "unknown keys length conservatively yields an unknown map and preserves marks",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1).Mark("p"), cty.NumberIntVal(2),
+			}),
+			Keys:   cty.UnknownVal(cty.List(cty.String)),
+			Want:   cty.UnknownVal(cty.Map(cty.List(cty.Number))).RefineNotNull().Mark("p"),
+		},
+		{
+			Name: "top-level marks of both containers propagate to the known result",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2),
+			}).Mark("v"),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}).Mark("k"),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+				"b": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+			}).Mark("v").Mark("k"),
+		},
+		{
+			Name: "empty result keeps the container marks",
+			Values: cty.ListValEmpty(cty.Number).Mark("m"),
+			Keys:   cty.ListValEmpty(cty.String).Mark("m"),
+			Want:   cty.MapValEmpty(cty.List(cty.Number)).Mark("m"),
+		},
+		{
+			// Map keys cannot carry marks, so a marked grouping key marks the
+			// whole result instead of leaking its name through an unmarked
+			// map key.
+			Name: "marked key element marks the whole result map",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a").Mark("secret"), cty.StringVal("b"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+				"b": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+			}).Mark("secret"),
+		},
+		{
+			Name: "unmarked value element marks stay on the element",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1).Mark("p"), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{cty.NumberIntVal(1).Mark("p")}),
+				"b": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+			}),
+		},
+		{
+			Name:   "known group structure survives a marked, known-length unknown values list",
+			Values: cty.UnknownVal(cty.List(cty.Number)).Refine().CollectionLength(2).NewValue().Mark("v"),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Want: cty.MapVal(map[string]cty.Value{
+				"a": cty.ListVal([]cty.Value{cty.UnknownVal(cty.Number)}),
+				"b": cty.ListVal([]cty.Value{cty.UnknownVal(cty.Number)}),
+			}).Mark("v"),
+		},
+		{
+			Name:   "dynamic values yield a dynamic result",
+			Values: cty.DynamicVal,
+			Keys:   cty.ListValEmpty(cty.String),
+			Want:   cty.DynamicVal,
+		},
+
+		// Error cases.
+		{
+			Name:   "null values list is rejected",
+			Values: cty.NullVal(cty.List(cty.Number)),
+			Keys:   cty.ListValEmpty(cty.String),
+			Err:    "argument must not be null",
+		},
+		{
+			Name:   "null keys list is rejected",
+			Values: cty.ListValEmpty(cty.Number),
+			Keys:   cty.NullVal(cty.List(cty.String)),
+			Err:    "argument must not be null",
+		},
+		{
+			Name: "null key element is rejected",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.NullVal(cty.String),
+			}),
+			Err: "keys list has null value at index 1",
+		},
+		{
+			Name: "known unequal lengths are rejected",
+			Values: cty.ListVal([]cty.Value{
+				cty.NumberIntVal(1), cty.NumberIntVal(2), cty.NumberIntVal(3),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Err: "number of keys (2) does not match number of values (3)",
+		},
+		{
+			// The values length is at least three but the keys list is
+			// provably of length two, so the intervals don't intersect.
+			Name:   "disjoint length intervals are rejected even while lengths are unknown",
+			Values: cty.UnknownVal(cty.List(cty.Number)).Refine().CollectionLengthLowerBound(3).NewValue(),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Err: "length of keys list is not consistent with length of values list",
+		},
+		{
+			// Tuples are not lists and their heterogeneous elements must not
+			// be papered over with unsafe type unification.
+			Name: "heterogeneous tuple values are rejected rather than unified",
+			Values: cty.TupleVal([]cty.Value{
+				cty.StringVal("x"), cty.NumberIntVal(1),
+			}),
+			Keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"),
+			}),
+			Err: "values argument must be a list",
+		},
+		{
+			Name:   "non-string keys list is rejected",
+			Values: cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+			Keys:   cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+			Err:    "string required, but received number",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.Name, func(t *testing.T) {
+			got, err := GroupBy(test.Values, test.Keys)
+			if test.Err != "" {
+				if err == nil {
+					t.Fatalf("succeeded with %#v; want error containing %q", got, test.Err)
+				}
+				if !strings.Contains(err.Error(), test.Err) {
+					t.Fatalf("wrong error\ngot:  %s\nwant substring: %s", err.Error(), test.Err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %s", err)
+			}
+			if !got.RawEquals(test.Want) {
+				t.Errorf("wrong result\ngot:  %#v\nwant: %#v", got, test.Want)
+			}
+		})
+	}
+}
+
+// TestGroupByUnknownKeyBounds checks the group-count range exposed by the
+// result value's own refinements, which is what downstream consumers use to
+// reason about unknown results.
+func TestGroupByUnknownKeyBounds(t *testing.T) {
+	tests := []struct {
+		keys                 cty.Value
+		valuesLen            int
+		wantLower, wantUpper int
+	}{
+		{
+			keys: cty.ListVal([]cty.Value{
+				cty.UnknownVal(cty.String), cty.UnknownVal(cty.String),
+			}),
+			valuesLen:  2,
+			wantLower:  1,
+			wantUpper:  2,
+		},
+		{
+			keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.UnknownVal(cty.String), cty.UnknownVal(cty.String),
+			}),
+			valuesLen:  3,
+			wantLower:  1,
+			wantUpper:  3,
+		},
+		{
+			keys: cty.ListVal([]cty.Value{
+				cty.StringVal("a"), cty.StringVal("b"), cty.UnknownVal(cty.String),
+			}),
+			valuesLen:  3,
+			wantLower:  2,
+			wantUpper:  3,
+		},
+	}
+
+	for _, test := range tests {
+		values := make([]cty.Value, test.valuesLen)
+		for i := range values {
+			values[i] = cty.NumberIntVal(int64(i))
+		}
+		got, err := GroupBy(cty.ListVal(values), test.keys)
+		if err != nil {
+			t.Fatalf("unexpected error: %s", err)
+		}
+		if got.IsKnown() {
+			t.Fatalf("result is known; want an unknown map: %#v", got)
+		}
+		rng := got.Range()
+		if lower := rng.LengthLowerBound(); lower != test.wantLower {
+			t.Errorf("wrong lower bound for %#v: got %d, want %d", test.keys, lower, test.wantLower)
+		}
+		if upper := rng.LengthUpperBound(); upper != test.wantUpper {
+			t.Errorf("wrong upper bound for %#v: got %d, want %d", test.keys, upper, test.wantUpper)
+		}
+	}
+}
+
+// TestGroupByMarkedKeyDoesNotLeak verifies that a marked key cannot reveal
+// the structure of the result to a caller that doesn't hold the mark.
+func TestGroupByMarkedKeyDoesNotLeak(t *testing.T) {
+	values := cty.ListVal([]cty.Value{
+		cty.NumberIntVal(1), cty.NumberIntVal(2),
+	})
+	keys := cty.ListVal([]cty.Value{
+		cty.StringVal("a").Mark("secret"), cty.StringVal("b"),
+	})
+
+	got, err := GroupBy(values, keys)
+	if err != nil {
+		t.Fatalf("unexpected error: %s", err)
+	}
+	if !got.IsMarked() {
+		t.Fatal("result is not marked even though a grouping key was marked")
+	}
+	if _, marked := got.Marks()["secret"]; !marked {
+		t.Fatalf("result marks %#v do not include the key mark", got.Marks())
+	}
+
+	// The marked result must not expose its keys or group lists directly.
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("AsValueMap succeeded on a marked result; structure leaked through unmarked keys")
+			}
+		}()
+		_ = got.AsValueMap()
+	}()
+
+	// A holder of the mark can unwrap the result and see the correct groups.
+	unmarked, _ := got.Unmark()
+	if !unmarked.RawEquals(cty.MapVal(map[string]cty.Value{
+		"a": cty.ListVal([]cty.Value{cty.NumberIntVal(1)}),
+		"b": cty.ListVal([]cty.Value{cty.NumberIntVal(2)}),
+	})) {
+		t.Fatalf("wrong unmarked result: %#v", unmarked)
 	}
 }

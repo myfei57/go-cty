@@ -1430,6 +1430,311 @@ var ZipmapFunc = function.New(&function.Spec{
 	},
 })
 
+// GroupByFunc is a function that rearranges the elements of a list into a
+// map of lists, using the elements of a corresponding list of strings as
+// keys. The two lists must be of equal length.
+//
+// The resulting map has one key for each distinct grouping key, and each
+// element appears in the order it had in the original values list, including
+// any duplicates. Keys are compared after cty's usual Unicode normalization,
+// and the empty string is a valid key.
+//
+// Unlike the default handling of unknown values, if the keys are all known
+// then the group structure is known even if some (or all) of the values are
+// unknown: unknown values are placed into the groups defined by their keys,
+// and a wholly-unknown values list of known length still produces accurately
+// sized group lists of typed unknown elements.
+//
+// If one or more keys are unknown then the entire result is unknown, although
+// its length may still be refined to a range based on the known keys.
+var GroupByFunc = function.New(&function.Spec{
+	Description: `Groups the elements of a list into a map of lists, using a corresponding list of string keys. The two lists must be of equal length.`,
+	Params: []function.Parameter{
+		{
+			Name:             "values",
+			Description:      `The list whose elements will be distributed into groups.`,
+			Type:             cty.DynamicPseudoType,
+			AllowUnknown:     true,
+			AllowDynamicType: true,
+			AllowMarked:      true,
+		},
+		{
+			Name:             "keys",
+			Description:      `A list of strings of the same length as "values", selecting the group for each element.`,
+			Type:             cty.List(cty.String),
+			AllowUnknown:     true,
+			AllowDynamicType: true,
+			AllowMarked:      true,
+		},
+	},
+	Type: func(args []cty.Value) (cty.Type, error) {
+		plan, err := analyzeGroupBy(args[0], args[1])
+		if err != nil {
+			return cty.NilType, err
+		}
+		return plan.resultTy, nil
+	},
+	RefineResult: refineNonNull,
+	Impl: func(args []cty.Value, retType cty.Type) (cty.Value, error) {
+		// Only the shallow marks directly on the containers are peeled off
+		// here; any marks nested inside the elements are handled explicitly
+		// below so that value-element marks can stay on their elements while
+		// key-element marks (which map keys cannot carry) aggregate onto the
+		// result as a whole.
+		values, valuesMarks := args[0].Unmark()
+		keys, keysMarks := args[1].Unmark()
+
+		out, extraMarks, err := groupByImpl(values, keys, retType)
+		if err != nil {
+			return cty.NilVal, err
+		}
+		return out.WithMarks(valuesMarks, keysMarks, extraMarks), nil
+	},
+})
+
+// groupByPlan summarizes everything that can be determined about a GroupBy
+// call from the arguments, independently of marks.
+type groupByPlan struct {
+	resultTy cty.Type
+	ety      cty.Type
+
+	// lengthKnown is true only when both lists are provably of the same
+	// exact length, in which case length is that length.
+	lengthKnown bool
+	length      int
+
+	// keysKnown is true when every grouping key is a known, non-null
+	// string.
+	keysKnown bool
+
+	// knownKeys are the normalized distinct known keys, in the order in
+	// which they first appear.
+	knownKeys []string
+
+	// unknownKeys is the number of key elements whose string values are
+	// not known.
+	unknownKeys int
+}
+
+// analyzeGroupBy performs the parts of argument validation and result
+// planning that are shared between the type and implementation functions.
+//
+// Marks never influence the plan, so marked containers and key elements are
+// accepted here and handled by the caller.
+func analyzeGroupBy(values, keys cty.Value) (groupByPlan, error) {
+	var plan groupByPlan
+
+	valuesTy := values.Type()
+	keysTy := keys.Type()
+	if valuesTy == cty.DynamicPseudoType || keysTy == cty.DynamicPseudoType {
+		// Nothing useful can be said about the result until the dynamic
+		// value gains a concrete type.
+		plan.resultTy = cty.DynamicPseudoType
+		return plan, nil
+	}
+
+	if !valuesTy.IsListType() {
+		// GroupBy intentionally requires a homogeneous list rather than
+		// unifying the element types of a possibly-heterogeneous tuple, so
+		// that the map(list(T)) contract is always honored exactly.
+		return plan, function.NewArgErrorf(0, "values argument must be a list, got %s", valuesTy.FriendlyName())
+	}
+	if !keysTy.IsListType() || keysTy.ElementType() != cty.String {
+		return plan, function.NewArgErrorf(1, "keys argument must be a list of strings, got %s", keysTy.FriendlyName())
+	}
+
+	plan.ety = valuesTy.ElementType()
+	plan.resultTy = cty.Map(cty.List(plan.ety))
+
+	if values.IsNull() {
+		return plan, function.NewArgErrorf(0, "argument must not be null")
+	}
+	if keys.IsNull() {
+		return plan, function.NewArgErrorf(1, "argument must not be null")
+	}
+
+	// Range requires an unmarked value, and marks don't influence lengths.
+	valuesUnmarked, _ := values.Unmark()
+	keysUnmarked, _ := keys.Unmark()
+	valuesRng := valuesUnmarked.Range()
+	keysRng := keysUnmarked.Range()
+	vLo, vHi := valuesRng.LengthLowerBound(), valuesRng.LengthUpperBound()
+	kLo, kHi := keysRng.LengthLowerBound(), keysRng.LengthUpperBound()
+
+	// The two lists must be of equal length. If their possible-length
+	// intervals don't intersect then they can never be equal, which is a
+	// definite error even though the exact lengths may be unknown.
+	if vLo > kHi || kLo > vHi {
+		if vLo == vHi && kLo == kHi {
+			return plan, function.NewArgErrorf(1, "number of keys (%d) does not match number of values (%d)", kLo, vLo)
+		}
+		return plan, function.NewArgErrorf(1, "length of keys list is not consistent with length of values list")
+	}
+
+	if !(vLo == vHi && kLo == kHi && vLo == kLo) {
+		// The lengths might still be equal or might differ, so the result
+		// is conservatively unknown and no group structure is claimed.
+		return plan, nil
+	}
+	plan.lengthKnown = true
+	plan.length = vLo
+
+	if plan.length == 0 {
+		// Two empty lists always produce a known empty map.
+		plan.keysKnown = true
+		return plan, nil
+	}
+
+	if !keysUnmarked.IsKnown() {
+		// The keys container is of known length but wholly unknown, so all
+		// of its elements behave as unknown keys. (Exact-length unknown
+		// lists normally present as known lists of unknown elements
+		// instead, but handle both representations.)
+		plan.unknownKeys = plan.length
+		return plan, nil
+	}
+
+	keyElems := keysUnmarked.AsValueSlice()
+	seen := make(map[string]struct{}, plan.length)
+	for i, key := range keyElems {
+		key, _ = key.Unmark()
+		if key.IsNull() {
+			return plan, function.NewArgErrorf(1, "keys list has null value at index %d", i)
+		}
+		if !key.IsKnown() {
+			plan.unknownKeys++
+			continue
+		}
+		name := cty.NormalizeString(key.AsString())
+		if _, exists := seen[name]; !exists {
+			seen[name] = struct{}{}
+			plan.knownKeys = append(plan.knownKeys, name)
+		}
+	}
+	plan.keysKnown = plan.unknownKeys == 0
+	return plan, nil
+}
+
+// groupByImpl implements GroupBy assuming the argument types have already
+// been accepted. The shallow container marks are returned separately by the
+// caller; this function only returns additional marks found on key elements
+// (or hoisted from value elements when the structure is unknown).
+func groupByImpl(values, keys cty.Value, retType cty.Type) (cty.Value, cty.ValueMarks, error) {
+	if retType == cty.DynamicPseudoType {
+		return cty.DynamicVal, nil, nil
+	}
+
+	plan, err := analyzeGroupBy(values, keys)
+	if err != nil {
+		return cty.NilVal, nil, err
+	}
+	ety := plan.ety
+
+	values, _ = values.Unmark()
+	keys, _ = keys.Unmark()
+
+	// Individual key elements are reachable whenever the keys container is
+	// known, which it normally is even when some elements are unknown.
+	var keyElems []cty.Value
+	if keys.IsKnown() && keys.Length().IsKnown() {
+		keyElems = keys.AsValueSlice()
+	}
+
+	// Map keys cannot carry marks of their own, so marks on grouping keys
+	// must always be carried by the resulting map as a whole; otherwise the
+	// unmarked map keys would disclose the marked key's group structure.
+	var extraMarks cty.ValueMarks
+	for _, key := range keyElems {
+		_, marks := key.Unmark()
+		extraMarks = cty.NewValueMarks(extraMarks, marks)
+	}
+
+	// hoistValueMarks is used on paths that return an unknown result as a
+	// whole, where concrete group lists don't exist to carry element marks:
+	// dropping the marks would disclose their absence and could leak data.
+	hoistValueMarks := func() {
+		if values.IsKnown() && values.Length().IsKnown() {
+			for _, v := range values.AsValueSlice() {
+				_, marks := v.UnmarkDeep()
+				extraMarks = cty.NewValueMarks(extraMarks, marks)
+			}
+		}
+	}
+
+	if !plan.lengthKnown {
+		// The lengths are not provably equal yet, so claiming any particular
+		// structure could turn a future length mismatch into an apparently
+		// successful known result.
+		hoistValueMarks()
+		return cty.UnknownVal(retType), extraMarks, nil
+	}
+	n := plan.length
+	if n == 0 {
+		return cty.MapValEmpty(cty.List(ety)), extraMarks, nil
+	}
+
+	if !plan.keysKnown {
+		// At least one key is unknown, so we must not predict any group
+		// names. String prefixes are deliberately not used to guess. The
+		// whole result is unknown, but the number of groups is bounded:
+		// each unknown key can add at most one new group, and a non-empty
+		// input always has at least one group.
+		lower := len(plan.knownKeys)
+		if lower < 1 {
+			lower = 1
+		}
+		upper := len(plan.knownKeys) + plan.unknownKeys
+
+		hoistValueMarks()
+
+		ret := cty.UnknownVal(retType).Refine().
+			CollectionLengthLowerBound(lower).
+			CollectionLengthUpperBound(upper).
+			NewValue()
+		return ret, extraMarks, nil
+	}
+
+	// All keys are known, so the group structure is fully known even if
+	// some (or all) of the values are unknown. Groups are built in the
+	// order of first appearance so that within-group ordering simply
+	// follows the original values list.
+	groups := make(map[string][]cty.Value, n)
+	order := make([]string, 0, n)
+	if values.IsKnown() {
+		valElems := values.AsValueSlice()
+		for i, key := range keyElems {
+			key, _ = key.Unmark()
+			name := cty.NormalizeString(key.AsString())
+			if _, exists := groups[name]; !exists {
+				order = append(order, name)
+			}
+			// Value elements are moved verbatim, keeping any marks (even
+			// deep ones) and without re-encoding values such as objects.
+			groups[name] = append(groups[name], valElems[i])
+		}
+	} else {
+		// The values container itself is unknown but of known length, so
+		// each group still has an accurate length; fill it with typed
+		// unknown elements instead of collapsing the whole structure.
+		unknownElem := cty.UnknownVal(ety)
+		for _, key := range keyElems {
+			key, _ = key.Unmark()
+			name := cty.NormalizeString(key.AsString())
+			if _, exists := groups[name]; !exists {
+				order = append(order, name)
+				groups[name] = make([]cty.Value, 0, 1)
+			}
+			groups[name] = append(groups[name], unknownElem)
+		}
+	}
+
+	out := make(map[string]cty.Value, len(order))
+	for _, name := range order {
+		out[name] = cty.ListVal(groups[name])
+	}
+	return cty.MapVal(out), extraMarks, nil
+}
+
 // helper function to add an element to a list, if it does not already exist
 func appendIfMissing(slice []cty.Value, element cty.Value) ([]cty.Value, error) {
 	for _, ele := range slice {
@@ -1547,4 +1852,15 @@ func Values(values cty.Value) (cty.Value, error) {
 // Zipmap constructs a map from a list of keys and a corresponding list of values.
 func Zipmap(keys, values cty.Value) (cty.Value, error) {
 	return ZipmapFunc.Call([]cty.Value{keys, values})
+}
+
+// GroupBy groups the elements of values into a map of lists, using the
+// corresponding elements of keys as group names. The two arguments must be
+// lists of equal length; keys must be a list of strings.
+//
+// Elements sharing a key are kept in their original order and are not
+// deduplicated. Keys are compared after cty's usual Unicode normalization,
+// and the empty string is a valid key.
+func GroupBy(values, keys cty.Value) (cty.Value, error) {
+	return GroupByFunc.Call([]cty.Value{values, keys})
 }

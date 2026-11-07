@@ -29,6 +29,13 @@ import (
 // the encapsulated type itself is serializable with the Marshal function
 // in encoding/json.
 func Marshal(val cty.Value, t cty.Type) ([]byte, error) {
+	return marshalValue(val, t, nil)
+}
+
+// marshalValue contains the shared implementation of package-level Marshal
+// and CapsuleTypeRegistry.Marshal, with a nil registry selecting the
+// default, capsule-unaware behavior.
+func marshalValue(val cty.Value, t cty.Type, reg *CapsuleTypeRegistry) ([]byte, error) {
 	errs := val.Type().TestConformance(t)
 	if errs != nil {
 		// Attempt a conversion
@@ -43,7 +50,7 @@ func Marshal(val cty.Value, t cty.Type) ([]byte, error) {
 
 	buf := &bytes.Buffer{}
 	var path cty.Path
-	err := marshal(val, t, path, buf)
+	err := marshal(val, t, path, buf, reg)
 
 	if err != nil {
 		return nil, err
@@ -61,5 +68,5 @@ func Marshal(val cty.Value, t cty.Type) ([]byte, error) {
 // may be a cty.PathError.
 func Unmarshal(buf []byte, t cty.Type) (cty.Value, error) {
 	var path cty.Path
-	return unmarshal(buf, t, path)
+	return unmarshal(buf, t, path, nil)
 }

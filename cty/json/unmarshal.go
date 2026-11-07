@@ -10,7 +10,7 @@ import (
 	"github.com/zclconf/go-cty/cty/convert"
 )
 
-func unmarshal(buf []byte, t cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshal(buf []byte, t cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 
 	tok, err := dec.Token()
@@ -23,7 +23,7 @@ func unmarshal(buf []byte, t cty.Type, path cty.Path) (cty.Value, error) {
 	}
 
 	if t == cty.DynamicPseudoType {
-		return unmarshalDynamic(buf, path)
+		return unmarshalDynamic(buf, path, reg)
 	}
 
 	switch {
@@ -34,16 +34,19 @@ func unmarshal(buf []byte, t cty.Type, path cty.Path) (cty.Value, error) {
 		}
 		return val, nil
 	case t.IsListType():
-		return unmarshalList(buf, t.ElementType(), path)
+		return unmarshalList(buf, t.ElementType(), path, reg)
 	case t.IsSetType():
-		return unmarshalSet(buf, t.ElementType(), path)
+		return unmarshalSet(buf, t.ElementType(), path, reg)
 	case t.IsMapType():
-		return unmarshalMap(buf, t.ElementType(), path)
+		return unmarshalMap(buf, t.ElementType(), path, reg)
 	case t.IsTupleType():
-		return unmarshalTuple(buf, t.TupleElementTypes(), path)
+		return unmarshalTuple(buf, t.TupleElementTypes(), path, reg)
 	case t.IsObjectType():
-		return unmarshalObject(buf, t.AttributeTypes(), path)
+		return unmarshalObject(buf, t.AttributeTypes(), path, reg)
 	case t.IsCapsuleType():
+		if reg != nil {
+			return reg.unmarshalCapsuleValue(buf, t, path)
+		}
 		return unmarshalCapsule(buf, t, path)
 	default:
 		return cty.NilVal, path.NewErrorf("unsupported type %s", t.FriendlyName())
@@ -101,7 +104,7 @@ func unmarshalPrimitive(tok json.Token, t cty.Type, path cty.Path) (cty.Value, e
 	}
 }
 
-func unmarshalList(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshalList(buf []byte, ety cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '['); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -124,7 +127,7 @@ func unmarshalList(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 				return cty.NilVal, path.NewErrorf("failed to read list value: %s", err)
 			}
 
-			el, err := unmarshal(rawVal, ety, path)
+			el, err := unmarshal(rawVal, ety, path, reg)
 			if err != nil {
 				return cty.NilVal, err
 			}
@@ -144,7 +147,7 @@ func unmarshalList(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 	return cty.ListVal(vals), nil
 }
 
-func unmarshalSet(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshalSet(buf []byte, ety cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '['); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -165,7 +168,7 @@ func unmarshalSet(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 				return cty.NilVal, path.NewErrorf("failed to read set value: %s", err)
 			}
 
-			el, err := unmarshal(rawVal, ety, path)
+			el, err := unmarshal(rawVal, ety, path, reg)
 			if err != nil {
 				return cty.NilVal, err
 			}
@@ -185,7 +188,7 @@ func unmarshalSet(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 	return cty.SetVal(vals), nil
 }
 
-func unmarshalMap(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshalMap(buf []byte, ety cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '{'); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -217,7 +220,7 @@ func unmarshalMap(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 				return cty.NilVal, path.NewErrorf("failed to read map value: %s", err)
 			}
 
-			el, err := unmarshal(rawVal, ety, path)
+			el, err := unmarshal(rawVal, ety, path, reg)
 			if err != nil {
 				return cty.NilVal, err
 			}
@@ -237,7 +240,7 @@ func unmarshalMap(buf []byte, ety cty.Type, path cty.Path) (cty.Value, error) {
 	return cty.MapVal(vals), nil
 }
 
-func unmarshalTuple(buf []byte, etys []cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshalTuple(buf []byte, etys []cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '['); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -265,7 +268,7 @@ func unmarshalTuple(buf []byte, etys []cty.Type, path cty.Path) (cty.Value, erro
 				return cty.NilVal, path.NewErrorf("failed to read tuple value: %s", err)
 			}
 
-			el, err := unmarshal(rawVal, ety, path)
+			el, err := unmarshal(rawVal, ety, path, reg)
 			if err != nil {
 				return cty.NilVal, err
 			}
@@ -289,7 +292,7 @@ func unmarshalTuple(buf []byte, etys []cty.Type, path cty.Path) (cty.Value, erro
 	return cty.TupleVal(vals), nil
 }
 
-func unmarshalObject(buf []byte, atys map[string]cty.Type, path cty.Path) (cty.Value, error) {
+func unmarshalObject(buf []byte, atys map[string]cty.Type, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '{'); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -324,7 +327,7 @@ func unmarshalObject(buf []byte, atys map[string]cty.Type, path cty.Path) (cty.V
 				return cty.NilVal, path.NewErrorf("failed to read object value: %s", err)
 			}
 
-			el, err := unmarshal(rawVal, aty, path)
+			el, err := unmarshal(rawVal, aty, path, reg)
 			if err != nil {
 				return cty.NilVal, err
 			}
@@ -364,7 +367,7 @@ func unmarshalCapsule(buf []byte, t cty.Type, path cty.Path) (cty.Value, error) 
 	return cty.CapsuleVal(t, ptr), nil
 }
 
-func unmarshalDynamic(buf []byte, path cty.Path) (cty.Value, error) {
+func unmarshalDynamic(buf []byte, path cty.Path, reg *CapsuleTypeRegistry) (cty.Value, error) {
 	dec := bufDecoder(buf)
 	if err := requireDelim(dec, '{'); err != nil {
 		return cty.NilVal, path.NewError(err)
@@ -388,7 +391,11 @@ func unmarshalDynamic(buf []byte, path cty.Path) (cty.Value, error) {
 
 		switch key {
 		case "type":
-			err := json.Unmarshal(rawVal, &t)
+			if reg != nil {
+				t, err = reg.unmarshalType(rawVal)
+			} else {
+				err = json.Unmarshal(rawVal, &t)
+			}
 			if err != nil {
 				return cty.NilVal, path.NewErrorf("failed to decode type for dynamic value: %s", err)
 			}
@@ -411,7 +418,10 @@ func unmarshalDynamic(buf []byte, path cty.Path) (cty.Value, error) {
 		return cty.NilVal, path.NewErrorf("missing value in dynamically-typed value")
 	}
 
-	val, err := Unmarshal([]byte(valBody), t)
+	// Start with an empty path so that any error within the value is
+	// reported relative to the dynamic value's own location; NewError
+	// concatenates it onto the path leading here.
+	val, err := unmarshal([]byte(valBody), t, nil, reg)
 	if err != nil {
 		return cty.NilVal, path.NewError(err)
 	}

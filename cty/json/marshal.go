@@ -8,7 +8,7 @@ import (
 	"github.com/zclconf/go-cty/cty"
 )
 
-func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
+func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer, reg *CapsuleTypeRegistry) error {
 	if val.IsMarked() {
 		return path.NewErrorf("value has marks, so it cannot be serialized as JSON")
 	}
@@ -19,7 +19,7 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 	// If we're going to decode as DynamicPseudoType then we need to save
 	// dynamic type information to recover the real type.
 	if t == cty.DynamicPseudoType && val.Type() != cty.DynamicPseudoType {
-		return marshalDynamic(val, path, b)
+		return marshalDynamic(val, path, b, reg)
 	}
 
 	if val.IsNull() {
@@ -70,7 +70,7 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 			path[len(path)-1] = cty.IndexStep{
 				Key: ek,
 			}
-			err := marshal(ev, ety, path, b)
+			err := marshal(ev, ety, path, b, reg)
 			if err != nil {
 				return err
 			}
@@ -93,12 +93,12 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 				Key: ek,
 			}
 			var err error
-			err = marshal(ek, ek.Type(), path, b)
+			err = marshal(ek, ek.Type(), path, b, reg)
 			if err != nil {
 				return err
 			}
 			b.WriteRune(':')
-			err = marshal(ev, ety, path, b)
+			err = marshal(ev, ety, path, b, reg)
 			if err != nil {
 				return err
 			}
@@ -121,7 +121,7 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 			path[len(path)-1] = cty.IndexStep{
 				Key: ek,
 			}
-			err := marshal(ev, ety, path, b)
+			err := marshal(ev, ety, path, b, reg)
 			if err != nil {
 				return err
 			}
@@ -150,12 +150,12 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 				Name: k,
 			}
 			var err error
-			err = marshal(cty.StringVal(k), cty.String, path, b)
+			err = marshal(cty.StringVal(k), cty.String, path, b, reg)
 			if err != nil {
 				return err
 			}
 			b.WriteRune(':')
-			err = marshal(av, aty, path, b)
+			err = marshal(av, aty, path, b, reg)
 			if err != nil {
 				return err
 			}
@@ -163,6 +163,9 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 		b.WriteRune('}')
 		return nil
 	case t.IsCapsuleType():
+		if reg != nil {
+			return reg.marshalCapsuleValue(val, t, path, b)
+		}
 		rawVal := val.EncapsulatedValue()
 		jsonVal, err := json.Marshal(rawVal)
 		if err != nil {
@@ -178,13 +181,19 @@ func marshal(val cty.Value, t cty.Type, path cty.Path, b *bytes.Buffer) error {
 
 // marshalDynamic adds an extra wrapping object containing dynamic type
 // information for the given value.
-func marshalDynamic(val cty.Value, path cty.Path, b *bytes.Buffer) error {
-	typeJSON, err := MarshalType(val.Type())
+func marshalDynamic(val cty.Value, path cty.Path, b *bytes.Buffer, reg *CapsuleTypeRegistry) error {
+	var typeJSON []byte
+	var err error
+	if reg != nil {
+		typeJSON, err = reg.marshalType(val.Type())
+	} else {
+		typeJSON, err = MarshalType(val.Type())
+	}
 	if err != nil {
 		return path.NewErrorf("failed to serialize type: %s", err)
 	}
 	b.WriteString(`{"value":`)
-	err = marshal(val, val.Type(), path, b)
+	err = marshal(val, val.Type(), path, b, reg)
 	if err != nil {
 		return path.NewErrorf("failed to serialize value: %s", err)
 	}
